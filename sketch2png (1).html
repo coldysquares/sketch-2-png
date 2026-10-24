@@ -110,6 +110,7 @@
     }
     .btn:active { transform: scale(0.97); opacity: 0.85; }
     .btn.active { background: var(--accent); border-color: #60a5fa; color: #fff; }
+    .btn.small { font-size: 0.74rem; padding: 8px; }
     .btn-primary { background: var(--accent); border-color: #60a5fa; color: #fff; }
     .btn-success { background: var(--accent-2); border-color: #34d399; color: #052e16; }
 
@@ -130,6 +131,7 @@
       height: 22px;
       margin: 0;
     }
+    input[type="range"]:disabled { opacity: 0.4; }
 
     details summary {
       font-size: 0.78rem;
@@ -154,6 +156,7 @@
       min-height: 240px;
       margin-bottom: 12px;
       position: relative;
+      touch-action: none;
     }
     .bg-checker-dark  { background: repeating-conic-gradient(#1c1c21 0% 25%, #111114 0% 50%) 50% / 16px 16px; }
     .bg-checker-light { background: repeating-conic-gradient(#e4e4e7 0% 25%, #ffffff 0% 50%) 50% / 16px 16px; }
@@ -165,6 +168,8 @@
       max-height: 48vh;
       max-height: 48dvh;
       object-fit: contain;
+      transform-origin: 50% 50%;
+      will-change: transform;
     }
 
     .placeholder {
@@ -200,6 +205,8 @@
     }
 
     #export-panel { display: none; margin-bottom: 0; }
+    .svg-opts { display: none; gap: 10px; flex-direction: column; margin-bottom: 8px; }
+    .hint { font-size: 0.68rem; color: var(--subtext); opacity: 0.8; }
   </style>
 </head>
 <body>
@@ -216,10 +223,11 @@
   <div id="canvas-container" class="canvas-wrap bg-checker-dark">
     <div id="placeholder" class="placeholder">
       Tap <b>Load</b> or <b>Snap</b> below.<br>
-      <small>Exports include SHA-256 short-hashes for clean catalog indexing.</small>
+      <small>Exports include SHA-256 short-hashes for clean catalog indexing.<br>Pinch or double-tap the preview to zoom.</small>
     </div>
     <canvas id="canvas"></canvas>
     <div id="hud" class="canvas-hud">
+      <button id="fit-btn" class="hud-pill" type="button" style="display:none;">⤢ Fit</button>
       <button id="bg-btn" class="hud-pill" type="button">BG: Dark</button>
       <button id="hold-orig" class="hud-pill" type="button">👁 Hold: Original</button>
     </div>
@@ -247,7 +255,7 @@
     </div>
   </div>
 
-  <!-- Sliders and crop -->
+  <!-- Sliders, toggles, crop -->
   <div class="panel controls">
     <div class="control-group">
       <div class="control-header">
@@ -263,6 +271,19 @@
         <span id="smooth-val">18</span>
       </div>
       <input type="range" id="smoothing" min="0" max="75" value="18">
+    </div>
+
+    <div class="control-group">
+      <div class="control-header">
+        <span>Speck Removal (Min Blob Size)</span>
+        <span id="speck-val">6</span>
+      </div>
+      <input type="range" id="speck" min="0" max="60" value="6">
+    </div>
+
+    <div class="grid-2">
+      <button id="flatten-btn" class="btn small" type="button">💡 Even Lighting: On</button>
+      <button id="light-btn" class="btn small" type="button">🖍 Light Ink: On</button>
     </div>
 
     <details>
@@ -287,11 +308,332 @@
       <button class="btn fmt-btn" data-fmt="webp" type="button">WebP (Small)</button>
       <button class="btn fmt-btn" data-fmt="svg" type="button">SVG (Vector)</button>
     </div>
+
+    <div id="svg-opts" class="svg-opts">
+      <div class="control-group">
+        <div class="control-header">
+          <span>Vector Detail (Curve Fit Tolerance)</span>
+          <span id="vec-detail-val">6</span>
+        </div>
+        <input type="range" id="vec-detail" min="1" max="10" value="6">
+      </div>
+      <div class="control-group">
+        <div class="control-header">
+          <span>Vector Colors (Keep Color only)</span>
+          <span id="vec-colors-val">4</span>
+        </div>
+        <input type="range" id="vec-colors" min="2" max="8" value="4">
+      </div>
+      <span class="hint">SVG is traced into smooth Bézier curves. Black and White ink export one path; Keep Color exports stacked color layers.</span>
+    </div>
+
+    <button id="sidecar-btn" class="btn small mb-8" type="button" style="width:100%;">{ } JSON Sidecar: Off</button>
+
     <div class="grid-2">
       <button id="copy-btn" class="btn" type="button">📋 Copy Image</button>
       <button id="share-btn" class="btn btn-primary" type="button">⬆️ Share / Save</button>
     </div>
   </div>
+
+  <!-- Vector tracer: runs in a Web Worker, with a main-thread fallback -->
+  <script id="trace-src" type="text/plain">
+function hex2(v) {
+  v = Math.max(0, Math.min(255, Math.round(v)));
+  return (v < 16 ? '0' : '') + v.toString(16);
+}
+
+function luma3(c) { return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]; }
+
+// Cluster the ink colors, returned lightest first, with a per-pixel rank map (255 = no ink).
+function quantizeInk(data, w, h, K) {
+  var n = w * h, i, s, ci;
+  var lim = 200, cnt = 0;
+  for (i = 0; i < n; i++) if (data[i * 4 + 3] >= lim) cnt++;
+  if (cnt < 50) {
+    lim = 1; cnt = 0;
+    for (i = 0; i < n; i++) if (data[i * 4 + 3] >= lim) cnt++;
+  }
+  var rank = new Uint8Array(n).fill(255);
+  if (cnt === 0) return { palette: [], rank: rank };
+
+  var stride = Math.max(1, Math.floor(cnt / 20000));
+  var sm = [], seen = 0;
+  for (i = 0; i < n; i++) {
+    if (data[i * 4 + 3] >= lim) {
+      if (seen % stride === 0) sm.push(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]);
+      seen++;
+    }
+  }
+  var sn = sm.length / 3;
+  var k = Math.min(K, sn);
+  var cen = [[sm[0], sm[1], sm[2]]];
+  var minD = new Float64Array(sn).fill(Infinity);
+  while (cen.length < k) {
+    var c = cen[cen.length - 1], best = -1, bd = -1;
+    for (s = 0; s < sn; s++) {
+      var dr = sm[s * 3] - c[0], dg = sm[s * 3 + 1] - c[1], db = sm[s * 3 + 2] - c[2];
+      var d = dr * dr + dg * dg + db * db;
+      if (d < minD[s]) minD[s] = d;
+      if (minD[s] > bd) { bd = minD[s]; best = s; }
+    }
+    if (bd < 100) break;
+    cen.push([sm[best * 3], sm[best * 3 + 1], sm[best * 3 + 2]]);
+  }
+
+  var counts = [];
+  for (var it = 0; it < 8; it++) {
+    var sum = cen.map(function () { return [0, 0, 0, 0]; });
+    for (s = 0; s < sn; s++) {
+      var bi = 0, bdist = Infinity;
+      for (ci = 0; ci < cen.length; ci++) {
+        var er = sm[s * 3] - cen[ci][0], eg = sm[s * 3 + 1] - cen[ci][1], eb = sm[s * 3 + 2] - cen[ci][2];
+        var dd = er * er + eg * eg + eb * eb;
+        if (dd < bdist) { bdist = dd; bi = ci; }
+      }
+      sum[bi][0] += sm[s * 3]; sum[bi][1] += sm[s * 3 + 1]; sum[bi][2] += sm[s * 3 + 2]; sum[bi][3]++;
+    }
+    counts = [];
+    for (ci = 0; ci < cen.length; ci++) {
+      counts.push(sum[ci][3]);
+      if (sum[ci][3]) cen[ci] = [sum[ci][0] / sum[ci][3], sum[ci][1] / sum[ci][3], sum[ci][2] / sum[ci][3]];
+    }
+  }
+
+  var pal = [], bigIdx = 0;
+  for (ci = 0; ci < cen.length; ci++) {
+    if (counts[ci] > counts[bigIdx]) bigIdx = ci;
+    if (counts[ci] >= Math.max(1, 0.003 * sn)) pal.push(cen[ci]);
+  }
+  if (!pal.length) pal.push(cen[bigIdx]);
+  pal.sort(function (a, b) { return luma3(b) - luma3(a); });
+
+  for (i = 0; i < n; i++) {
+    if (data[i * 4 + 3] === 0) continue;
+    var r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2];
+    var pi = 0, pd = Infinity;
+    for (ci = 0; ci < pal.length; ci++) {
+      var qr = r - pal[ci][0], qg = g - pal[ci][1], qb = b - pal[ci][2];
+      var q = qr * qr + qg * qg + qb * qb;
+      if (q < pd) { pd = q; pi = ci; }
+    }
+    rank[i] = pi;
+  }
+  return { palette: pal, rank: rank };
+}
+
+// Ramer-Douglas-Peucker on a closed loop. Returns the kept vertex indices in order.
+function simplifyClosed(xs, ys, eps) {
+  var n = xs.length, k, out = [];
+  if (n < 5) { for (k = 0; k < n; k++) out.push(k); return out; }
+  var f = 0, fd = -1;
+  for (k = 1; k < n; k++) {
+    var dx0 = xs[k] - xs[0], dy0 = ys[k] - ys[0];
+    var dd = dx0 * dx0 + dy0 * dy0;
+    if (dd > fd) { fd = dd; f = k; }
+  }
+  var keep = new Uint8Array(n);
+  keep[0] = 1; keep[f] = 1;
+  var stack = [[0, f], [f, n]];
+  while (stack.length) {
+    var rg = stack.pop(), a = rg[0], b = rg[1];
+    if (b - a < 2) continue;
+    var ax = xs[a % n], ay = ys[a % n], bx = xs[b % n], by = ys[b % n];
+    var dx = bx - ax, dy = by - ay, len = Math.sqrt(dx * dx + dy * dy);
+    var md = -1, mk = -1;
+    for (k = a + 1; k < b; k++) {
+      var px = xs[k % n] - ax, py = ys[k % n] - ay, d;
+      if (len > 1e-9) d = Math.abs(px * dy - py * dx) / len;
+      else d = Math.sqrt(px * px + py * py);
+      if (d > md) { md = d; mk = k; }
+    }
+    if (md > eps) {
+      keep[mk % n] = 1;
+      stack.push([a, mk]);
+      stack.push([mk, b]);
+    }
+  }
+  for (k = 0; k < n; k++) if (keep[k]) out.push(k);
+  return out;
+}
+
+function rnd(v) { return Math.round(v * 100) / 100; }
+
+// Turn one simplified loop into a smooth closed cubic Bezier path.
+function loopPath(xs, ys, eps) {
+  var idx = simplifyClosed(xs, ys, eps);
+  var m = idx.length, k;
+  if (m < 3) return '';
+  var X = new Array(m), Y = new Array(m);
+  for (k = 0; k < m; k++) { X[k] = xs[idx[k]]; Y[k] = ys[idx[k]]; }
+
+  var area = 0;
+  for (k = 0; k < m; k++) {
+    var j = (k + 1) % m;
+    area += X[k] * Y[j] - X[j] * Y[k];
+  }
+  if (Math.abs(area) / 2 < 1.5) return '';
+
+  var tx = new Float64Array(m), ty = new Float64Array(m), corner = new Uint8Array(m);
+  for (k = 0; k < m; k++) {
+    var p = (k + m - 1) % m, q = (k + 1) % m;
+    var ix = X[k] - X[p], iy = Y[k] - Y[p], ox = X[q] - X[k], oy = Y[q] - Y[k];
+    var il = Math.sqrt(ix * ix + iy * iy) || 1, ol = Math.sqrt(ox * ox + oy * oy) || 1;
+    if ((ix * ox + iy * oy) / (il * ol) < 0.57) corner[k] = 1;
+    var cx = X[q] - X[p], cy = Y[q] - Y[p], cl = Math.sqrt(cx * cx + cy * cy) || 1;
+    tx[k] = cx / cl; ty[k] = cy / cl;
+  }
+
+  var d = 'M' + rnd(X[0]) + ' ' + rnd(Y[0]);
+  for (k = 0; k < m; k++) {
+    var q2 = (k + 1) % m;
+    var ax = X[k], ay = Y[k], bx = X[q2], by = Y[q2];
+    var sx = bx - ax, sy = by - ay, len = Math.sqrt(sx * sx + sy * sy);
+    var last = (k === m - 1);
+    if (corner[k] && corner[q2]) {
+      if (!last) d += 'L' + rnd(bx) + ' ' + rnd(by);
+      continue;
+    }
+    var ux = sx / (len || 1), uy = sy / (len || 1);
+    var t1x = corner[k] ? ux : tx[k], t1y = corner[k] ? uy : ty[k];
+    var t2x = corner[q2] ? ux : tx[q2], t2y = corner[q2] ? uy : ty[q2];
+    var hl = len / 3;
+    d += 'C' + rnd(ax + t1x * hl) + ' ' + rnd(ay + t1y * hl) + ' ' +
+         rnd(bx - t2x * hl) + ' ' + rnd(by - t2y * hl) + ' ' + rnd(bx) + ' ' + rnd(by);
+  }
+  return d + 'Z';
+}
+
+// Marching squares on a soft alpha field, then stitch, simplify and curve-fit every loop.
+function traceField(field, w, h, eps) {
+  var PW = w + 2, PH = h + 2, x, y;
+  var P = new Float32Array(PW * PH);
+  for (y = 0; y < h; y++) {
+    var src = y * w, dst = (y + 1) * PW + 1;
+    for (x = 0; x < w; x++) P[dst + x] = field[src + x];
+  }
+  var T = new Float32Array(PW * PH);
+  for (y = 0; y < PH; y++) {
+    var r = y * PW;
+    for (x = 1; x < PW - 1; x++) T[r + x] = (P[r + x - 1] + 2 * P[r + x] + P[r + x + 1]) * 0.25;
+  }
+  for (y = 1; y < PH - 1; y++) {
+    var r2 = y * PW;
+    for (x = 0; x < PW; x++) P[r2 + x] = (T[r2 - PW + x] + 2 * T[r2 + x] + T[r2 + PW + x]) * 0.25;
+  }
+  T = null;
+
+  var ISO = 0.42;
+  var segA = [], segB = [];
+  var m1 = new Map(), m2 = new Map();
+  var sc = 0;
+  function link(e, s) { if (m1.has(e)) m2.set(e, s); else m1.set(e, s); }
+  function add(e0, e1) {
+    segA.push(e0); segB.push(e1);
+    link(e0, sc); link(e1, sc);
+    sc++;
+  }
+
+  for (var j = 0; j < PH - 1; j++) {
+    var r0 = j * PW, r1 = r0 + PW;
+    for (var i = 0; i < PW - 1; i++) {
+      var a = P[r0 + i], b = P[r0 + i + 1], c = P[r1 + i + 1], d = P[r1 + i];
+      var idx = (a >= ISO ? 8 : 0) | (b >= ISO ? 4 : 0) | (c >= ISO ? 2 : 0) | (d >= ISO ? 1 : 0);
+      if (idx === 0 || idx === 15) continue;
+      var Te = 2 * (r0 + i), Be = 2 * (r1 + i), Le = Te + 1, Re = 2 * (r0 + i + 1) + 1;
+      switch (idx) {
+        case 1: add(Le, Be); break;
+        case 2: add(Be, Re); break;
+        case 3: add(Le, Re); break;
+        case 4: add(Te, Re); break;
+        case 5:
+          if ((a + b + c + d) * 0.25 >= ISO) { add(Te, Le); add(Be, Re); }
+          else { add(Te, Re); add(Le, Be); }
+          break;
+        case 6: add(Te, Be); break;
+        case 7: add(Te, Le); break;
+        case 8: add(Te, Le); break;
+        case 9: add(Te, Be); break;
+        case 10:
+          if ((a + b + c + d) * 0.25 >= ISO) { add(Te, Re); add(Le, Be); }
+          else { add(Te, Le); add(Be, Re); }
+          break;
+        case 11: add(Te, Re); break;
+        case 12: add(Le, Re); break;
+        case 13: add(Be, Re); break;
+        case 14: add(Le, Be); break;
+      }
+    }
+  }
+
+  function edgeX(id) {
+    var cell = id >> 1, jj = (cell / PW) | 0, ii = cell - jj * PW, v0, v1, t;
+    if (id & 1) return ii - 0.5;
+    v0 = P[cell]; v1 = P[cell + 1];
+    t = (ISO - v0) / (v1 - v0);
+    return ii + t - 0.5;
+  }
+  function edgeY(id) {
+    var cell = id >> 1, jj = (cell / PW) | 0, v0, v1, t;
+    if (!(id & 1)) return jj - 0.5;
+    v0 = P[cell]; v1 = P[cell + PW];
+    t = (ISO - v0) / (v1 - v0);
+    return jj + t - 0.5;
+  }
+
+  var used = new Uint8Array(sc);
+  var parts = [];
+  for (var s = 0; s < sc; s++) {
+    if (used[s]) continue;
+    used[s] = 1;
+    var start = segA[s], cur = segB[s], curSeg = s;
+    var ids = [start];
+    while (cur !== start) {
+      ids.push(cur);
+      var nxt = m1.get(cur);
+      if (nxt === curSeg) nxt = m2.get(cur);
+      if (nxt === undefined || used[nxt]) break;
+      used[nxt] = 1;
+      cur = (segA[nxt] === cur) ? segB[nxt] : segA[nxt];
+      curSeg = nxt;
+    }
+    if (ids.length < 4) continue;
+    var xs = new Float64Array(ids.length), ys = new Float64Array(ids.length);
+    for (var q = 0; q < ids.length; q++) { xs[q] = edgeX(ids[q]); ys[q] = edgeY(ids[q]); }
+    var p = loopPath(xs, ys, eps);
+    if (p) parts.push(p);
+  }
+  return parts.join('');
+}
+
+// msg: { data: RGBA Uint8ClampedArray, w, h, colorMode, ink, K, eps }
+function traceJob(msg) {
+  var data = msg.data, w = msg.w, h = msg.h, n = w * h, i;
+  var layers = [];
+  if (!msg.colorMode) {
+    var field = new Float32Array(n), any = false;
+    for (i = 0; i < n; i++) {
+      var al = data[i * 4 + 3];
+      if (al) { field[i] = al / 255; any = true; }
+    }
+    if (any) layers.push({ fill: msg.ink === 'white' ? '#ffffff' : '#000000', d: traceField(field, w, h, msg.eps) });
+  } else {
+    var qz = quantizeInk(data, w, h, msg.K);
+    var f2 = new Float32Array(n);
+    for (var li = 0; li < qz.palette.length; li++) {
+      f2.fill(0);
+      var any2 = false;
+      for (i = 0; i < n; i++) {
+        var rk = qz.rank[i];
+        if (rk !== 255 && rk >= li) { f2[i] = data[i * 4 + 3] / 255; any2 = true; }
+      }
+      if (!any2) continue;
+      var pc = qz.palette[li];
+      layers.push({ fill: '#' + hex2(pc[0]) + hex2(pc[1]) + hex2(pc[2]), d: traceField(f2, w, h, msg.eps) });
+    }
+  }
+  return { w: w, h: h, layers: layers };
+}
+  </script>
 
   <script>
   (() => {
@@ -299,65 +641,204 @@
 
     // ---------- Helpers ----------
     const $ = (id) => document.getElementById(id);
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const clamp255 = (v) => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
 
     const store = {
       get(key) { try { return localStorage.getItem(key); } catch (_) { return null; } },
       set(key, value) { try { localStorage.setItem(key, value); } catch (_) { /* storage unavailable */ } }
     };
 
-    const clamp255 = (v) => Math.max(0, Math.min(255, Math.round(v)));
+    const nextTick = () => new Promise((r) => setTimeout(r, 0));
+    const canvasToBlob = (c, mime, q) => new Promise((res) => c.toBlob(res, mime, q));
+
+    function makeCanvas(w, h) {
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, w);
+      c.height = Math.max(1, h);
+      return c;
+    }
+    // iOS Safari holds canvas memory until released, so shrink canvases we are done with.
+    function release(c) { if (c) { c.width = 1; c.height = 1; } }
+
+    async function sha256(buffer) {
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+      return Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+
+    // ---------- Vector tracer plumbing (worker with main-thread fallback) ----------
+    const traceSrc = $('trace-src').textContent;
+    const traceMain = new Function(traceSrc + '\nreturn traceJob;')();
+    let workerURL = null;
+    try {
+      workerURL = URL.createObjectURL(new Blob([
+        traceSrc + '\nself.onmessage=function(e){var r;try{r=traceJob(e.data);}catch(err){r={error:String(err)};}self.postMessage(r);};'
+      ], { type: 'text/javascript' }));
+    } catch (_) { workerURL = null; }
+
+    let traceWorker = null;
+    let traceReject = null;
+    function cancelTrace() {
+      if (traceWorker) {
+        traceWorker.terminate();
+        traceWorker = null;
+      }
+      if (traceReject) {
+        const rej = traceReject;
+        traceReject = null;
+        rej(new Error('cancelled'));
+      }
+    }
+    function runTrace(payload) {
+      cancelTrace();
+      return new Promise((resolve, reject) => {
+        const fallback = async () => {
+          await nextTick();
+          try { resolve(traceMain(payload)); } catch (err) { reject(err); }
+        };
+        if (!workerURL) { fallback(); return; }
+        let w;
+        try { w = new Worker(workerURL); } catch (_) { fallback(); return; }
+        traceWorker = w;
+        traceReject = reject;
+        w.onmessage = (e) => {
+          if (traceWorker === w) { traceWorker = null; traceReject = null; }
+          w.terminate();
+          resolve(e.data);
+        };
+        w.onerror = () => {
+          if (traceWorker === w) { traceWorker = null; traceReject = null; }
+          w.terminate();
+          fallback();
+        };
+        w.postMessage(payload);
+      });
+    }
 
     // ---------- Elements ----------
     const upload = $('upload');
     const camera = $('camera');
     const canvas = $('canvas');
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const ctx = canvas.getContext('2d');
 
     const thresholdSlider = $('threshold');
     const smoothingSlider = $('smoothing');
+    const speckSlider = $('speck');
     const cropVSlider = $('crop-v');
     const cropHSlider = $('crop-h');
+    const vecDetailSlider = $('vec-detail');
+    const vecColorsSlider = $('vec-colors');
 
     const threshVal = $('thresh-val');
     const smoothVal = $('smooth-val');
+    const speckVal = $('speck-val');
     const cropVVal = $('crop-v-val');
     const cropHVal = $('crop-h-val');
+    const vecDetailVal = $('vec-detail-val');
+    const vecColorsVal = $('vec-colors-val');
 
     const rotateBtn = $('rotate-btn');
     const trimBtn = $('trim-btn');
+    const flattenBtn = $('flatten-btn');
+    const lightBtn = $('light-btn');
     const bgBtn = $('bg-btn');
+    const fitBtn = $('fit-btn');
     const holdOrigBtn = $('hold-orig');
     const copyBtn = $('copy-btn');
     const shareBtn = $('share-btn');
+    const sidecarBtn = $('sidecar-btn');
 
     const canvasContainer = $('canvas-container');
     const placeholder = $('placeholder');
     const hud = $('hud');
     const exportPanel = $('export-panel');
+    const svgOpts = $('svg-opts');
     const meta = $('meta');
     const hashBadge = $('hash-badge');
 
-    // ---------- State ----------
+    // ---------- Constants ----------
+    const PREVIEW_MAX = 1400;
+    const PREVIEW_MAX_ZOOM = 3000;
+    const EXPORT_MAX = 4096;
+    const AREA_CAP = 13000000;
+    const SHARE_LABEL = '⬆️ Share / Save';
     const INK_MODES = ['black', 'white', 'color'];
+    const FORMATS = ['png', 'webp', 'svg'];
     const bgClasses = ['bg-checker-dark', 'bg-checker-light', 'bg-emerald'];
     const bgNames = ['BG: Dark', 'BG: Light', 'BG: Green'];
 
-    let sourceImage = null;
-    let rotation = 0; // 0, 90, 180, 270
-    let autoTrim = false;
-    let inkMode = INK_MODES.includes(store.get('s2p_inkMode')) ? store.get('s2p_inkMode') : 'black';
-    let exportFormat = 'png';
-    let bgIndex = 0;
-    let showingOriginal = false;
+    // ---------- Settings ----------
+    const DEFAULTS = {
+      thresh: 180, smooth: 18, speck: 6, ink: 'black', trim: false, fmt: 'png', bg: 0,
+      flatten: true, lightInk: true, vecDetail: 6, vecColors: 4, sidecar: false
+    };
 
-    // Restore saved slider values
-    if (store.get('s2p_thresh')) thresholdSlider.value = store.get('s2p_thresh');
-    if (store.get('s2p_smooth')) smoothingSlider.value = store.get('s2p_smooth');
+    function loadSettings() {
+      let saved = {};
+      try { saved = JSON.parse(store.get('s2p_settings') || '{}') || {}; } catch (_) { saved = {}; }
+      const legacy = {};
+      const lt = parseInt(store.get('s2p_thresh'), 10);
+      const ls = parseInt(store.get('s2p_smooth'), 10);
+      if (!isNaN(lt)) legacy.thresh = lt;
+      if (!isNaN(ls)) legacy.smooth = ls;
+      if (INK_MODES.includes(store.get('s2p_inkMode'))) legacy.ink = store.get('s2p_inkMode');
+      const s = Object.assign({}, DEFAULTS, legacy, saved);
+      s.thresh = clamp(parseInt(s.thresh, 10) || DEFAULTS.thresh, 20, 250);
+      s.smooth = clamp(isNaN(parseInt(s.smooth, 10)) ? DEFAULTS.smooth : parseInt(s.smooth, 10), 0, 75);
+      s.speck = clamp(isNaN(parseInt(s.speck, 10)) ? DEFAULTS.speck : parseInt(s.speck, 10), 0, 60);
+      s.vecDetail = clamp(parseInt(s.vecDetail, 10) || DEFAULTS.vecDetail, 1, 10);
+      s.vecColors = clamp(parseInt(s.vecColors, 10) || DEFAULTS.vecColors, 2, 8);
+      if (!INK_MODES.includes(s.ink)) s.ink = DEFAULTS.ink;
+      if (!FORMATS.includes(s.fmt)) s.fmt = DEFAULTS.fmt;
+      s.bg = clamp(parseInt(s.bg, 10) || 0, 0, bgClasses.length - 1);
+      s.trim = !!s.trim; s.flatten = !!s.flatten; s.lightInk = !!s.lightInk; s.sidecar = !!s.sidecar;
+      return s;
+    }
+
+    const S = loadSettings();
+    thresholdSlider.value = S.thresh;
+    smoothingSlider.value = S.smooth;
+    speckSlider.value = S.speck;
+    vecDetailSlider.value = S.vecDetail;
+    vecColorsSlider.value = S.vecColors;
+
+    // ---------- State ----------
+    let sourceImage = null;
+    let sourceId = 0;
+    let sourceName = '';
+    let rotation = 0; // 0, 90, 180, 270
+    let autoTrim = S.trim;
+    let flatten = S.flatten;
+    let lightInk = S.lightInk;
+    let inkMode = S.ink;
+    let exportFormat = S.fmt;
+    let sidecarOn = S.sidecar;
+    let bgIndex = S.bg;
+    let showingOriginal = false;
+    let hiRes = false;
+
+    canvasContainer.classList.remove(bgClasses[0]);
+    canvasContainer.classList.add(bgClasses[bgIndex]);
+    bgBtn.textContent = bgNames[bgIndex];
+
+    function saveSettings() {
+      store.set('s2p_settings', JSON.stringify({
+        thresh: parseInt(thresholdSlider.value, 10),
+        smooth: parseInt(smoothingSlider.value, 10),
+        speck: parseInt(speckSlider.value, 10),
+        ink: inkMode, trim: autoTrim, fmt: exportFormat, bg: bgIndex,
+        flatten, lightInk,
+        vecDetail: parseInt(vecDetailSlider.value, 10),
+        vecColors: parseInt(vecColorsSlider.value, 10),
+        sidecar: sidecarOn
+      }));
+    }
 
     // ---------- Apple touch icon (iOS ignores SVG icons, so render a PNG) ----------
     (function setupIcon() {
-      const c = document.createElement('canvas');
-      c.width = c.height = 180;
+      const c = makeCanvas(180, 180);
       const g = c.getContext('2d');
       g.fillStyle = '#09090b';
       g.fillRect(0, 0, 180, 180);
@@ -384,23 +865,45 @@
 
     // ---------- Status badge ----------
     let statusTimer = null;
+    let busyCount = 0;
+    let exportDims = null;
     function dimsText() {
-      return sourceImage ? `${canvas.width}×${canvas.height}` : 'Ready';
+      if (busyCount > 0) return 'Working…';
+      return exportDims ? `${exportDims.w}×${exportDims.h}` : 'Ready';
     }
     function setStatus(message) {
       meta.textContent = message;
       clearTimeout(statusTimer);
       statusTimer = setTimeout(() => { meta.textContent = dimsText(); }, 2500);
     }
+    function setBusy(message) {
+      busyCount++;
+      clearTimeout(statusTimer);
+      meta.textContent = message;
+    }
+    function clearBusy() {
+      busyCount = Math.max(0, busyCount - 1);
+      if (busyCount === 0) meta.textContent = dimsText();
+    }
 
     // ---------- UI sync ----------
     function syncUI() {
       threshVal.textContent = thresholdSlider.value;
       smoothVal.textContent = smoothingSlider.value;
+      speckVal.textContent = speckSlider.value;
       cropVVal.textContent = `${cropVSlider.value}%`;
       cropHVal.textContent = `${cropHSlider.value}%`;
+      vecDetailVal.textContent = vecDetailSlider.value;
+      vecColorsVal.textContent = vecColorsSlider.value;
+
       trimBtn.textContent = `✂️ Trim: ${autoTrim ? 'On' : 'Off'}`;
       trimBtn.classList.toggle('active', autoTrim);
+      flattenBtn.textContent = `💡 Even Lighting: ${flatten ? 'On' : 'Off'}`;
+      flattenBtn.classList.toggle('active', flatten);
+      lightBtn.textContent = `🖍 Light Ink: ${lightInk ? 'On' : 'Off'}`;
+      lightBtn.classList.toggle('active', lightInk);
+      sidecarBtn.textContent = `{ } JSON Sidecar: ${sidecarOn ? 'On' : 'Off'}`;
+      sidecarBtn.classList.toggle('active', sidecarOn);
 
       document.querySelectorAll('.ink-mode').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.mode === inkMode);
@@ -408,9 +911,141 @@
       document.querySelectorAll('.fmt-btn').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.fmt === exportFormat);
       });
+
+      svgOpts.style.display = exportFormat === 'svg' ? 'flex' : 'none';
+      vecColorsSlider.disabled = inkMode !== 'color';
     }
 
+    // ---------- Zoom and pan ----------
+    const view = { s: 1, x: 0, y: 0 };
+    const pointers = new Map();
+    let pinch = null;
+    let lastTap = 0;
+
+    function clampView() {
+      view.s = clamp(view.s, 1, 8);
+      const w = canvas.offsetWidth, h = canvas.offsetHeight;
+      const cw = canvasContainer.clientWidth, ch = canvasContainer.clientHeight;
+      const maxX = Math.max(0, (w * view.s - cw) / 2);
+      const maxY = Math.max(0, (h * view.s - ch) / 2);
+      view.x = clamp(view.x, -maxX, maxX);
+      view.y = clamp(view.y, -maxY, maxY);
+    }
+
+    function applyView() {
+      canvas.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.s})`;
+      fitBtn.style.display = view.s > 1.01 ? '' : 'none';
+      const wantHi = view.s > 1.6;
+      if (wantHi !== hiRes) {
+        hiRes = wantHi;
+        scheduleProcess();
+      }
+    }
+
+    function resetView() {
+      view.s = 1; view.x = 0; view.y = 0;
+      applyView();
+    }
+
+    function zoomAt(newS, cx, cy) {
+      const rect = canvasContainer.getBoundingClientRect();
+      const ox = rect.left + rect.width / 2, oy = rect.top + rect.height / 2;
+      const px = (cx - ox - view.x) / view.s;
+      const py = (cy - oy - view.y) / view.s;
+      view.s = clamp(newS, 1, 8);
+      view.x = cx - ox - px * view.s;
+      view.y = cy - oy - py * view.s;
+      clampView();
+      applyView();
+    }
+
+    function startPinch() {
+      const [a, b] = Array.from(pointers.values());
+      const rect = canvasContainer.getBoundingClientRect();
+      pinch = {
+        dist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+        s: view.s, vx: view.x, vy: view.y,
+        mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2,
+        ox: rect.left + rect.width / 2, oy: rect.top + rect.height / 2
+      };
+    }
+
+    function updatePinch() {
+      const [a, b] = Array.from(pointers.values());
+      const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      const ns = clamp(pinch.s * dist / pinch.dist, 1, 8);
+      const px = (pinch.mx - pinch.ox - pinch.vx) / pinch.s;
+      const py = (pinch.my - pinch.oy - pinch.vy) / pinch.s;
+      view.s = ns;
+      view.x = (mx - pinch.ox) - px * ns;
+      view.y = (my - pinch.oy) - py * ns;
+      clampView();
+      applyView();
+    }
+
+    canvasContainer.addEventListener('pointerdown', (e) => {
+      if (!sourceImage || e.target.closest('.hud-pill')) return;
+      try { canvasContainer.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: performance.now() });
+      if (pointers.size === 2) startPinch();
+    });
+
+    canvasContainer.addEventListener('pointermove', (e) => {
+      const p = pointers.get(e.pointerId);
+      if (!p) return;
+      const dx = e.clientX - p.x, dy = e.clientY - p.y;
+      p.x = e.clientX; p.y = e.clientY;
+      if (pointers.size === 2 && pinch) {
+        updatePinch();
+      } else if (pointers.size === 1 && view.s > 1.001) {
+        view.x += dx; view.y += dy;
+        clampView();
+        applyView();
+      }
+    });
+
+    function endPointer(e) {
+      const p = pointers.get(e.pointerId);
+      if (!p) return;
+      pointers.delete(e.pointerId);
+      if (pointers.size < 2) pinch = null;
+      if (e.type === 'pointerup' && pointers.size === 0) {
+        const moved = Math.hypot(p.x - p.sx, p.y - p.sy);
+        const now = performance.now();
+        if (moved < 8 && now - p.t < 300) {
+          if (now - lastTap < 320) {
+            lastTap = 0;
+            if (view.s > 1.01) resetView(); else zoomAt(2.5, e.clientX, e.clientY);
+          } else {
+            lastTap = now;
+          }
+        }
+      }
+    }
+    canvasContainer.addEventListener('pointerup', endPointer);
+    canvasContainer.addEventListener('pointercancel', endPointer);
+
+    canvasContainer.addEventListener('wheel', (e) => {
+      if (!sourceImage) return;
+      e.preventDefault();
+      zoomAt(view.s * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+    }, { passive: false });
+
+    window.addEventListener('resize', () => { clampView(); applyView(); });
+
     // ---------- File loading ----------
+    const baseCache = new Map();
+    const resultCache = new Map();
+
+    function resetCaches() {
+      for (const v of baseCache.values()) release(v.canvas);
+      baseCache.clear();
+      resultCache.clear();
+      exportCache = { key: null, promise: null, result: null };
+      cancelTrace();
+    }
+
     function handleFile(e) {
       const file = e.target.files[0];
       e.target.value = ''; // allow re-selecting the same file
@@ -421,12 +1056,18 @@
       img.onload = () => {
         URL.revokeObjectURL(url);
         sourceImage = img;
+        sourceId++;
+        sourceName = file.name || '';
         rotation = 0;
+        resetCaches();
+        resetView();
         canvas.style.display = 'block';
         placeholder.style.display = 'none';
         hud.style.display = 'flex';
         exportPanel.style.display = 'block';
+        resetShareLabel();
         processImage();
+        schedulePrepare();
       };
       img.onerror = () => {
         URL.revokeObjectURL(url);
@@ -435,10 +1076,8 @@
       img.src = url;
     }
 
-    // ---------- Core processing ----------
-    function processImage() {
-      if (!sourceImage) return;
-
+    // ---------- Geometry and base images ----------
+    function getGeometry(maxDim) {
       const W = sourceImage.naturalWidth;
       const H = sourceImage.naturalHeight;
       const rot90 = rotation % 180 !== 0;
@@ -454,96 +1093,336 @@
       const sy = Math.round(yInset);
       const sw = Math.max(1, Math.round(W - xInset * 2));
       const sh = Math.max(1, Math.round(H - yInset * 2));
+      const ow = rot90 ? sh : sw;
+      const oh = rot90 ? sw : sh;
+      const scale = Math.min(1, maxDim / Math.max(ow, oh), Math.sqrt(AREA_CAP / (ow * oh)));
+      const dw = Math.max(1, Math.round(sw * scale));
+      const dh = Math.max(1, Math.round(sh * scale));
+      return { sx, sy, sw, sh, rot90, scale, dw, dh, w: rot90 ? dh : dw, h: rot90 ? dw : dh };
+    }
 
-      // Offscreen canvas with rotation applied
-      const off = document.createElement('canvas');
-      const octx = off.getContext('2d', { willReadFrequently: true });
-      off.width = rot90 ? sh : sw;
-      off.height = rot90 ? sw : sh;
+    // Downscale in halving steps so large camera frames do not alias.
+    function drawScaled(src, sx, sy, sw, sh, dw, dh) {
+      let cur = src, cx = sx, cy = sy, cSw = sw, cSh = sh;
+      let cw = sw, ch = sh;
+      while (cw / 2 >= dw && ch / 2 >= dh) {
+        const nw = Math.ceil(cw / 2), nh = Math.ceil(ch / 2);
+        const c = makeCanvas(nw, nh);
+        const g = c.getContext('2d');
+        g.imageSmoothingEnabled = true;
+        g.imageSmoothingQuality = 'high';
+        g.drawImage(cur, cx, cy, cSw, cSh, 0, 0, nw, nh);
+        if (cur !== src) release(cur);
+        cur = c; cx = 0; cy = 0; cSw = nw; cSh = nh; cw = nw; ch = nh;
+      }
+      const out = makeCanvas(dw, dh);
+      const g2 = out.getContext('2d', { willReadFrequently: true });
+      g2.imageSmoothingEnabled = true;
+      g2.imageSmoothingQuality = 'high';
+      g2.drawImage(cur, cx, cy, cSw, cSh, 0, 0, dw, dh);
+      if (cur !== src) release(cur);
+      return out;
+    }
 
-      octx.save();
-      octx.translate(off.width / 2, off.height / 2);
-      octx.rotate((rotation * Math.PI) / 180);
-      octx.drawImage(sourceImage, sx, sy, sw, sh, -sw / 2, -sh / 2, sw, sh);
-      octx.restore();
+    function cachePut(map, key, entry, budget, releaseOnEvict) {
+      map.set(key, entry);
+      let total = 0;
+      for (const v of map.values()) total += v.w * v.h;
+      for (const [k, v] of map) {
+        if (total <= budget || k === key) break;
+        map.delete(k);
+        total -= v.w * v.h;
+        if (releaseOnEvict) release(v.canvas);
+      }
+    }
 
-      if (showingOriginal) {
-        canvas.width = off.width;
-        canvas.height = off.height;
-        ctx.drawImage(off, 0, 0);
-        return;
+    function getBase(maxDim) {
+      const g = getGeometry(maxDim);
+      const key = [sourceId, rotation, cropVSlider.value, cropHSlider.value, g.w, g.h].join('|');
+      const hit = baseCache.get(key);
+      if (hit) { baseCache.delete(key); baseCache.set(key, hit); return hit; }
+
+      const scaled = drawScaled(sourceImage, g.sx, g.sy, g.sw, g.sh, g.dw, g.dh);
+      let out;
+      if (rotation === 0) {
+        out = scaled;
+      } else {
+        out = makeCanvas(g.w, g.h);
+        const c = out.getContext('2d', { willReadFrequently: true });
+        c.translate(g.w / 2, g.h / 2);
+        c.rotate((rotation * Math.PI) / 180);
+        c.drawImage(scaled, -g.dw / 2, -g.dh / 2);
+        release(scaled);
+      }
+      const entry = { canvas: out, w: g.w, h: g.h, scale: g.scale, grid: null };
+      cachePut(baseCache, key, entry, 30000000, true);
+      return entry;
+    }
+
+    // ---------- Paper (lighting) estimation ----------
+    function maxFilter(src, gw, gh, r) {
+      const tmp = new Float32Array(gw * gh);
+      const out = new Float32Array(gw * gh);
+      for (let y = 0; y < gh; y++) {
+        for (let x = 0; x < gw; x++) {
+          let m = -Infinity;
+          for (let k = -r; k <= r; k++) {
+            const v = src[y * gw + clamp(x + k, 0, gw - 1)];
+            if (v > m) m = v;
+          }
+          tmp[y * gw + x] = m;
+        }
+      }
+      for (let x = 0; x < gw; x++) {
+        for (let y = 0; y < gh; y++) {
+          let m = -Infinity;
+          for (let k = -r; k <= r; k++) {
+            const v = tmp[clamp(y + k, 0, gh - 1) * gw + x];
+            if (v > m) m = v;
+          }
+          out[y * gw + x] = m;
+        }
+      }
+      return out;
+    }
+
+    function boxBlur(src, gw, gh, r) {
+      const tmp = new Float32Array(gw * gh);
+      const out = new Float32Array(gw * gh);
+      const n = r * 2 + 1;
+      for (let y = 0; y < gh; y++) {
+        for (let x = 0; x < gw; x++) {
+          let s = 0;
+          for (let k = -r; k <= r; k++) s += src[y * gw + clamp(x + k, 0, gw - 1)];
+          tmp[y * gw + x] = s / n;
+        }
+      }
+      for (let x = 0; x < gw; x++) {
+        for (let y = 0; y < gh; y++) {
+          let s = 0;
+          for (let k = -r; k <= r; k++) s += tmp[clamp(y + k, 0, gh - 1) * gw + x];
+          out[y * gw + x] = s / n;
+        }
+      }
+      return out;
+    }
+
+    // Coarse per-channel estimate of the blank paper color across the frame.
+    function computePaperGrid(data, w, h) {
+      const blk = Math.max(4, Math.ceil(Math.max(w, h) / 110));
+      const gw = Math.ceil(w / blk), gh = Math.ceil(h / blk);
+      const SN = 6, cnt = SN * SN;
+      const raw = [new Float32Array(gw * gh), new Float32Array(gw * gh), new Float32Array(gw * gh)];
+      const vals = new Float32Array(cnt);
+      const pick = Math.floor(0.75 * (cnt - 1));
+
+      for (let gy = 0; gy < gh; gy++) {
+        for (let gx = 0; gx < gw; gx++) {
+          const x0 = gx * blk, y0 = gy * blk;
+          const bw = Math.min(blk, w - x0), bh = Math.min(blk, h - y0);
+          for (let c = 0; c < 3; c++) {
+            let k = 0;
+            for (let sy = 0; sy < SN; sy++) {
+              const yy = y0 + Math.min(bh - 1, Math.floor((sy + 0.5) * bh / SN));
+              for (let sx = 0; sx < SN; sx++) {
+                const xx = x0 + Math.min(bw - 1, Math.floor((sx + 0.5) * bw / SN));
+                vals[k++] = data[(yy * w + xx) * 4 + c];
+              }
+            }
+            vals.sort();
+            raw[c][gy * gw + gx] = vals[pick];
+          }
+        }
       }
 
-      // Luminance to alpha
-      const imgData = octx.getImageData(0, 0, off.width, off.height);
+      const chans = raw.map((g0) => {
+        let g = maxFilter(g0, gw, gh, 2);
+        g = boxBlur(g, gw, gh, 2);
+        g = boxBlur(g, gw, gh, 2);
+        const sorted = Float32Array.from(g).sort();
+        const P = sorted[Math.floor(0.85 * (sorted.length - 1))];
+        // Floor keeps large filled shapes from being normalized away.
+        const floor = Math.max(24, 0.5 * P);
+        for (let i = 0; i < g.length; i++) if (g[i] < floor) g[i] = floor;
+        return g;
+      });
+      return { blk, gw, gh, chans };
+    }
+
+    // ---------- Speck removal ----------
+    function removeSpecks(data, w, h, minArea) {
+      const n = w * h;
+      const seen = new Uint8Array(n);
+      const queue = new Int32Array(n);
+      for (let s = 0; s < n; s++) {
+        if (seen[s] || data[s * 4 + 3] === 0) continue;
+        let head = 0, tail = 0;
+        queue[tail++] = s;
+        seen[s] = 1;
+        while (head < tail) {
+          const p = queue[head++];
+          const px = p % w, py = (p / w) | 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            const ny = py + dy;
+            if (ny < 0 || ny >= h) continue;
+            for (let dx = -1; dx <= 1; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              const nx = px + dx;
+              if (nx < 0 || nx >= w) continue;
+              const q = ny * w + nx;
+              if (!seen[q] && data[q * 4 + 3] !== 0) {
+                seen[q] = 1;
+                queue[tail++] = q;
+              }
+            }
+          }
+        }
+        if (tail < minArea) {
+          for (let k = 0; k < tail; k++) data[queue[k] * 4 + 3] = 0;
+        }
+      }
+    }
+
+    // ---------- Core processing ----------
+    function paramKey() {
+      return [
+        sourceId, rotation, cropVSlider.value, cropHSlider.value,
+        thresholdSlider.value, smoothingSlider.value, speckSlider.value,
+        inkMode, autoTrim ? 1 : 0, flatten ? 1 : 0, lightInk ? 1 : 0
+      ].join('|');
+    }
+
+    function renderProcessed(maxDim) {
+      const base = getBase(maxDim);
+      const key = paramKey() + '|' + base.w + 'x' + base.h;
+      const hit = resultCache.get(key);
+      if (hit) { resultCache.delete(key); resultCache.set(key, hit); return hit; }
+
+      const w = base.w, h = base.h;
+      const imgData = base.canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h);
       const data = imgData.data;
       const thresh = parseInt(thresholdSlider.value, 10);
       const smooth = parseInt(smoothingSlider.value, 10);
+      const mode = inkMode;
+      const useMin = lightInk;
 
-      let minX = off.width, minY = off.height, maxX = -1, maxY = -1;
-      let hasOpaque = false;
+      let xi0 = null, xi1 = null, xt = null, gR = null, gG = null, gB = null;
+      let lineR = null, lineG = null, lineB = null, grid = null;
+      if (flatten) {
+        if (!base.grid) base.grid = computePaperGrid(data, w, h);
+        grid = base.grid;
+        xi0 = new Int32Array(w); xi1 = new Int32Array(w); xt = new Float32Array(w);
+        for (let x = 0; x < w; x++) {
+          const fx = (x + 0.5) / grid.blk - 0.5;
+          const i0 = Math.floor(fx);
+          xi0[x] = clamp(i0, 0, grid.gw - 1);
+          xi1[x] = clamp(i0 + 1, 0, grid.gw - 1);
+          xt[x] = fx - i0;
+        }
+        gR = grid.chans[0]; gG = grid.chans[1]; gB = grid.chans[2];
+        lineR = new Float32Array(grid.gw); lineG = new Float32Array(grid.gw); lineB = new Float32Array(grid.gw);
+      }
 
-      for (let y = 0; y < off.height; y++) {
-        for (let x = 0; x < off.width; x++) {
-          const i = (y * off.width + x) * 4;
-          const r = data[i], g = data[i + 1], b = data[i + 2];
+      for (let y = 0; y < h; y++) {
+        if (flatten) {
+          const fy = (y + 0.5) / grid.blk - 0.5;
+          const j0 = Math.floor(fy);
+          const yt = fy - j0;
+          const ya = clamp(j0, 0, grid.gh - 1) * grid.gw;
+          const yb = clamp(j0 + 1, 0, grid.gh - 1) * grid.gw;
+          for (let gx = 0; gx < grid.gw; gx++) {
+            lineR[gx] = gR[ya + gx] * (1 - yt) + gR[yb + gx] * yt;
+            lineG[gx] = gG[ya + gx] * (1 - yt) + gG[yb + gx] * yt;
+            lineB[gx] = gB[ya + gx] * (1 - yt) + gB[yb + gx] * yt;
+          }
+        }
+
+        for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 4;
+          let r = data[i], g = data[i + 1], b = data[i + 2];
+
+          if (flatten) {
+            const t = xt[x], u = 1 - t, a0 = xi0[x], a1 = xi1[x];
+            r = Math.min(255, r * 255 / (lineR[a0] * u + lineR[a1] * t));
+            g = Math.min(255, g * 255 / (lineG[a0] * u + lineG[a1] * t));
+            b = Math.min(255, b * 255 / (lineB[a0] * u + lineB[a1] * t));
+          }
+
           const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+          const m = useMin ? Math.min(r, g, b) : luma;
 
           let alpha = 0;
-          if (luma < thresh - smooth) {
+          if (m < thresh - smooth) {
             alpha = 255;
-          } else if (smooth > 0 && luma < thresh + smooth) {
-            alpha = Math.round(255 * (1 - (luma - (thresh - smooth)) / (smooth * 2)));
+          } else if (smooth > 0 && m < thresh + smooth) {
+            alpha = Math.round(255 * (1 - (m - (thresh - smooth)) / (smooth * 2)));
           }
 
           if (alpha > 0) {
-            if (inkMode === 'black') {
+            if (mode === 'black') {
               data[i] = 0; data[i + 1] = 0; data[i + 2] = 0;
-            } else if (inkMode === 'white') {
+            } else if (mode === 'white') {
               data[i] = 255; data[i + 1] = 255; data[i + 2] = 255;
             } else {
-              // Boost saturation so colored ink holds up once paper is removed
-              data[i]     = clamp255((r - luma) * 1.35 + luma * 0.75);
-              data[i + 1] = clamp255((g - luma) * 1.35 + luma * 0.75);
-              data[i + 2] = clamp255((b - luma) * 1.35 + luma * 0.75);
+              // Un-mix the paper contribution at soft edges, then boost chroma
+              const inv = 1 / Math.max(alpha / 255, 0.25);
+              const cr = clamp(255 - (255 - r) * inv, 0, 255);
+              const cg = clamp(255 - (255 - g) * inv, 0, 255);
+              const cb = clamp(255 - (255 - b) * inv, 0, 255);
+              const Y = 0.299 * cr + 0.587 * cg + 0.114 * cb;
+              data[i] = clamp255((cr - Y) * 1.35 + Y * 0.75);
+              data[i + 1] = clamp255((cg - Y) * 1.35 + Y * 0.75);
+              data[i + 2] = clamp255((cb - Y) * 1.35 + Y * 0.75);
             }
+          }
+          data[i + 3] = alpha;
+        }
+      }
 
-            if (alpha > 25) {
-              hasOpaque = true;
+      // Speck size is defined at a 1000px long side so it behaves the same at any resolution.
+      const speck = parseInt(speckSlider.value, 10);
+      const minArea = Math.round(speck * Math.pow(Math.max(w, h) / 1000, 2));
+      if (minArea >= 2) removeSpecks(data, w, h, minArea);
+
+      let minX = w, minY = h, maxX = -1, maxY = -1;
+      if (autoTrim) {
+        for (let y = 0; y < h; y++) {
+          const row = y * w * 4 + 3;
+          for (let x = 0; x < w; x++) {
+            if (data[row + x * 4] > 25) {
               if (x < minX) minX = x;
               if (x > maxX) maxX = x;
               if (y < minY) minY = y;
               if (y > maxY) maxY = y;
             }
           }
-          data[i + 3] = alpha;
         }
       }
+
+      const off = makeCanvas(w, h);
+      const octx = off.getContext('2d', { willReadFrequently: true });
       octx.putImageData(imgData, 0, 0);
 
-      // Optional auto-trim of empty margins
-      if (autoTrim && hasOpaque) {
-        const pad = 12;
+      let outCanvas = off, ow = w, oh = h;
+      if (autoTrim && maxX >= minX) {
+        const pad = Math.max(1, Math.round(Math.max(w, h) * 0.003));
         const x0 = Math.max(0, minX - pad);
         const y0 = Math.max(0, minY - pad);
-        const x1 = Math.min(off.width, maxX + 1 + pad);
-        const y1 = Math.min(off.height, maxY + 1 + pad);
-        const tw = x1 - x0;
-        const th = y1 - y0;
-        canvas.width = tw;
-        canvas.height = th;
-        ctx.drawImage(off, x0, y0, tw, th, 0, 0, tw, th);
-      } else {
-        canvas.width = off.width;
-        canvas.height = off.height;
-        ctx.drawImage(off, 0, 0);
+        const x1 = Math.min(w, maxX + 1 + pad);
+        const y1 = Math.min(h, maxY + 1 + pad);
+        ow = x1 - x0;
+        oh = y1 - y0;
+        outCanvas = makeCanvas(ow, oh);
+        outCanvas.getContext('2d', { willReadFrequently: true }).drawImage(off, x0, y0, ow, oh, 0, 0, ow, oh);
+        release(off);
       }
 
-      meta.textContent = dimsText();
-      updateShortHash();
+      const entry = { canvas: outCanvas, w: ow, h: oh, scale: base.scale };
+      cachePut(resultCache, key, entry, 40000000, false);
+      return entry;
     }
 
-    // Coalesce rapid slider events into one render per frame
+    // ---------- Preview ----------
     let framePending = false;
     function scheduleProcess() {
       if (framePending) return;
@@ -554,152 +1433,240 @@
       });
     }
 
-    // ---------- Hashing ----------
-    async function computeSHA256(buffer) {
-      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-      return Array.from(new Uint8Array(hashBuffer))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
+    function showOnDisplay(src) {
+      canvas.width = src.width;
+      canvas.height = src.height;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(src, 0, 0);
     }
 
-    let hashTimeout = null;
-    function updateShortHash() {
-      clearTimeout(hashTimeout);
-      hashTimeout = setTimeout(() => {
-        canvas.toBlob(async (blob) => {
-          if (!blob) return;
-          const fullHash = await computeSHA256(await blob.arrayBuffer());
-          hashBadge.textContent = `sha256: ${fullHash.slice(0, 8)}`;
-          hashBadge.dataset.fullHash = fullHash;
-        }, 'image/png');
-      }, 220);
-    }
+    function processImage() {
+      if (!sourceImage) return;
+      const maxDim = hiRes ? PREVIEW_MAX_ZOOM : PREVIEW_MAX;
 
-    // ---------- SVG export (run-length encoded pixel rows) ----------
-    function generateVectorSVG() {
-      const scale = Math.min(1, 900 / Math.max(canvas.width, canvas.height));
-      const w = Math.max(1, Math.round(canvas.width * scale));
-      const h = Math.max(1, Math.round(canvas.height * scale));
-
-      const temp = document.createElement('canvas');
-      temp.width = w;
-      temp.height = h;
-      const tctx = temp.getContext('2d', { willReadFrequently: true });
-      tctx.imageSmoothingQuality = 'high';
-      tctx.drawImage(canvas, 0, 0, w, h);
-      const data = tctx.getImageData(0, 0, w, h).data;
-
-      const colorMode = inkMode === 'color';
-      const groups = new Map(); // fill key -> path fragments
-      const addRun = (key, d) => {
-        let list = groups.get(key);
-        if (!list) { list = []; groups.set(key, list); }
-        list.push(d);
-      };
-      const hex = (v) => ((v >> 4) * 17).toString(16).padStart(2, '0');
-
-      for (let y = 0; y < h; y++) {
-        let runStart = -1;
-        let runKey = null;
-
-        for (let x = 0; x <= w; x++) {
-          let key = null;
-          if (x < w) {
-            const i = (y * w + x) * 4;
-            if (data[i + 3] > 110) {
-              key = colorMode ? `#${hex(data[i])}${hex(data[i + 1])}${hex(data[i + 2])}` : 'ink';
-            }
-          }
-
-          if (runStart !== -1 && key !== runKey) {
-            const len = x - runStart;
-            addRun(runKey, `M${runStart} ${y}h${len}v1h-${len}z`);
-            runStart = -1;
-          }
-          if (key !== null && runStart === -1) {
-            runStart = x;
-            runKey = key;
-          }
-        }
+      if (showingOriginal) {
+        showOnDisplay(getBase(maxDim).canvas);
+        return;
       }
 
-      const inkFill = inkMode === 'white' ? '#ffffff' : '#000000';
-      const paths = Array.from(groups, ([key, parts]) =>
-        `<path fill="${key === 'ink' ? inkFill : key}" d="${parts.join('')}"/>`
-      ).join('');
+      const res = renderProcessed(maxDim);
+      showOnDisplay(res.canvas);
 
-      const svg =
-        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" ` +
-        `width="${canvas.width}" height="${canvas.height}" shape-rendering="crispEdges">${paths}</svg>`;
-
-      return new Blob([svg], { type: 'image/svg+xml' });
+      const ratio = getGeometry(EXPORT_MAX).scale / res.scale;
+      exportDims = { w: Math.max(1, Math.round(res.w * ratio)), h: Math.max(1, Math.round(res.h * ratio)) };
+      if (busyCount === 0) meta.textContent = dimsText();
     }
 
     // ---------- Export ----------
-    async function getExportFile() {
-      let blob;
-      let ext = exportFormat;
+    function vecEps() {
+      return 1.8 * Math.pow(0.78, parseInt(vecDetailSlider.value, 10) - 1);
+    }
+
+    function exportKey() {
+      return [paramKey(), exportFormat, vecDetailSlider.value, vecColorsSlider.value].join('~');
+    }
+
+    async function buildSvgBlob() {
+      const colorMode = inkMode === 'color';
+      const traceMax = colorMode ? 1600 : 2000;
+      await nextTick();
+      const res = renderProcessed(traceMax);
+      const id = res.canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, res.w, res.h);
+      const out = await runTrace({
+        data: id.data, w: res.w, h: res.h,
+        colorMode, ink: inkMode,
+        K: parseInt(vecColorsSlider.value, 10),
+        eps: vecEps()
+      });
+      if (out.error) throw new Error(out.error);
+
+      const ratio = getGeometry(EXPORT_MAX).scale / getGeometry(traceMax).scale;
+      const W = Math.max(1, Math.round(res.w * ratio));
+      const H = Math.max(1, Math.round(res.h * ratio));
+      let body = '';
+      for (const layer of out.layers) {
+        body += `<path fill="${layer.fill}" fill-rule="evenodd" d="${layer.d}"/>`;
+      }
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${res.w} ${res.h}" width="${W}" height="${H}">${body}</svg>`;
+      return { blob: new Blob([svg], { type: 'image/svg+xml' }), width: W, height: H };
+    }
+
+    async function buildExport() {
+      let blob, width, height, ext = exportFormat;
 
       if (exportFormat === 'svg') {
-        blob = generateVectorSVG();
+        const r = await buildSvgBlob();
+        blob = r.blob; width = r.width; height = r.height;
       } else {
+        await nextTick();
+        const res = renderProcessed(EXPORT_MAX);
         const mime = exportFormat === 'webp' ? 'image/webp' : 'image/png';
-        blob = await new Promise((resolve) => canvas.toBlob(resolve, mime, 0.92));
+        blob = await canvasToBlob(res.canvas, mime, 0.92);
         if (!blob) throw new Error('Encode failed');
-        if (blob.type === 'image/png' && ext !== 'png') {
-          ext = 'png'; // browser fell back to PNG
-          setStatus('WebP unsupported, saved PNG');
-        }
+        if (blob.type !== mime && blob.type === 'image/png') ext = 'png'; // browser fell back to PNG
+        width = res.w; height = res.h;
       }
 
-      const hash = (await computeSHA256(await blob.arrayBuffer())).slice(0, 12);
-      const filename = `sketch_${hash}.${ext}`;
-      return { file: new File([blob], filename, { type: blob.type }), blob, filename };
+      const hash = await sha256(await blob.arrayBuffer());
+      const filename = `sketch_${hash.slice(0, 12)}.${ext}`;
+      return {
+        blob, filename, hash, ext, width, height,
+        fellBack: exportFormat === 'webp' && ext === 'png',
+        file: new File([blob], filename, { type: blob.type })
+      };
+    }
+
+    let exportCache = { key: null, promise: null, result: null };
+
+    function prepareExport() {
+      const key = exportKey();
+      if (exportCache.key === key && exportCache.promise) return exportCache.promise;
+      setBusy(exportFormat === 'svg' ? 'Tracing…' : 'Encoding…');
+      const promise = buildExport().then((r) => {
+        if (exportCache.key === key) exportCache.result = r;
+        return r;
+      }).catch((err) => {
+        if (exportCache.key === key) exportCache = { key: null, promise: null, result: null };
+        throw err;
+      }).finally(() => { clearBusy(); });
+      exportCache = { key, promise, result: null };
+      return promise;
+    }
+
+    let prepTimer = null;
+    function schedulePrepare() {
+      if (!sourceImage) return;
+      hashBadge.textContent = 'sha256: …';
+      delete hashBadge.dataset.fullHash;
+      clearTimeout(prepTimer);
+      prepTimer = setTimeout(() => {
+        const key = exportKey();
+        prepareExport().then((r) => {
+          if (exportKey() !== key) return;
+          hashBadge.textContent = `sha256: ${r.hash.slice(0, 8)}`;
+          hashBadge.dataset.fullHash = r.hash;
+          if (r.fellBack) setStatus('WebP unsupported, using PNG');
+        }).catch(() => { /* superseded or failed; the next change retries */ });
+      }, 900);
+    }
+
+    function makeSidecar(entry) {
+      const data = {
+        file: entry.filename,
+        sha256: entry.hash,
+        format: entry.ext,
+        width: entry.width,
+        height: entry.height,
+        createdAt: new Date().toISOString(),
+        source: sourceName || null,
+        settings: {
+          ink: inkMode,
+          threshold: parseInt(thresholdSlider.value, 10),
+          smoothing: parseInt(smoothingSlider.value, 10),
+          speckRemoval: parseInt(speckSlider.value, 10),
+          evenLighting: flatten,
+          lightInk,
+          trim: autoTrim,
+          rotation,
+          cropPercent: { topBottom: parseInt(cropVSlider.value, 10), leftRight: parseInt(cropHSlider.value, 10) },
+          vector: entry.ext === 'svg'
+            ? { detail: parseInt(vecDetailSlider.value, 10), colors: inkMode === 'color' ? parseInt(vecColorsSlider.value, 10) : 1 }
+            : null
+        }
+      };
+      return new File([JSON.stringify(data, null, 2)], entry.filename.replace(/\.[^.]+$/, '') + '.json', { type: 'application/json' });
+    }
+
+    function downloadFile(file) {
+      const url = URL.createObjectURL(file);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    }
+
+    async function shareEntry(entry) {
+      const files = [entry.file];
+      if (sidecarOn) files.push(makeSidecar(entry));
+
+      if (navigator.canShare && navigator.canShare({ files })) {
+        try {
+          await navigator.share({ files, title: entry.filename });
+          return 'shared';
+        } catch (err) {
+          if (err.name === 'AbortError') return 'cancelled';
+          if (err.name === 'NotAllowedError') return 'needs-gesture';
+          // otherwise fall through to download
+        }
+      }
+      files.forEach((f, idx) => setTimeout(() => downloadFile(f), idx * 350));
+      return 'downloaded';
+    }
+
+    function resetShareLabel() { shareBtn.textContent = SHARE_LABEL; }
+
+    // ---------- Change handlers ----------
+    function changed() {
+      resetShareLabel();
+      saveSettings();
+      syncUI();
+      scheduleProcess();
+      schedulePrepare();
+    }
+
+    function changedExportOnly() {
+      resetShareLabel();
+      saveSettings();
+      syncUI();
+      schedulePrepare();
     }
 
     // ---------- Events ----------
-    [thresholdSlider, smoothingSlider, cropVSlider, cropHSlider].forEach((slider) => {
-      slider.addEventListener('input', () => {
-        store.set('s2p_thresh', thresholdSlider.value);
-        store.set('s2p_smooth', smoothingSlider.value);
-        syncUI();
-        scheduleProcess();
-      });
+    [thresholdSlider, smoothingSlider, speckSlider, cropVSlider, cropHSlider].forEach((slider) => {
+      slider.addEventListener('input', changed);
+    });
+
+    [vecDetailSlider, vecColorsSlider].forEach((slider) => {
+      slider.addEventListener('input', changedExportOnly);
     });
 
     document.querySelectorAll('.ink-mode').forEach((btn) => {
       btn.addEventListener('click', () => {
         inkMode = btn.dataset.mode;
-        store.set('s2p_inkMode', inkMode);
-        syncUI();
-        processImage();
+        changed();
       });
     });
 
     document.querySelectorAll('.fmt-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         exportFormat = btn.dataset.fmt;
-        syncUI();
+        changedExportOnly();
       });
     });
 
     rotateBtn.addEventListener('click', () => {
       rotation = (rotation + 90) % 360;
-      processImage();
+      resetView();
+      changed();
     });
 
-    trimBtn.addEventListener('click', () => {
-      autoTrim = !autoTrim;
-      syncUI();
-      processImage();
-    });
+    trimBtn.addEventListener('click', () => { autoTrim = !autoTrim; changed(); });
+    flattenBtn.addEventListener('click', () => { flatten = !flatten; changed(); });
+    lightBtn.addEventListener('click', () => { lightInk = !lightInk; changed(); });
+    sidecarBtn.addEventListener('click', () => { sidecarOn = !sidecarOn; changedExportOnly(); });
 
     bgBtn.addEventListener('click', () => {
       canvasContainer.classList.remove(bgClasses[bgIndex]);
       bgIndex = (bgIndex + 1) % bgClasses.length;
       canvasContainer.classList.add(bgClasses[bgIndex]);
       bgBtn.textContent = bgNames[bgIndex];
+      saveSettings();
     });
+
+    fitBtn.addEventListener('click', resetView);
 
     // Hold to preview the original (pointer events cover touch and mouse once)
     function releaseOriginal() {
@@ -721,10 +1688,16 @@
     // Clipboard copy. Safari needs the blob passed as a promise so the
     // user gesture survives the async encode.
     copyBtn.addEventListener('click', async () => {
+      if (!sourceImage) return;
       const label = '📋 Copy Image';
       try {
         const blobPromise = new Promise((resolve, reject) => {
-          canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Encode failed'))), 'image/png');
+          setTimeout(() => {
+            try {
+              const res = renderProcessed(EXPORT_MAX);
+              res.canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Encode failed'))), 'image/png');
+            } catch (err) { reject(err); }
+          }, 0);
         });
         await navigator.clipboard.write([new ClipboardItem({ 'image/png': blobPromise })]);
         copyBtn.textContent = '✅ Copied!';
@@ -738,40 +1711,42 @@
       }
     });
 
-    // Share / save
+    // Share / save. A ready file shares instantly (iOS requires the tap to still be
+    // fresh); otherwise it prepares, and asks for a second tap if the share sheet needs one.
     shareBtn.addEventListener('click', async () => {
-      let exported;
-      try {
-        exported = await getExportFile();
-      } catch (err) {
-        setStatus('Export failed');
+      if (!sourceImage) return;
+      const key = exportKey();
+      let entry = exportCache.key === key ? exportCache.result : null;
+
+      if (!entry) {
+        shareBtn.textContent = '⏳ Preparing…';
+        try {
+          entry = await prepareExport();
+        } catch (err) {
+          resetShareLabel();
+          if (err && err.message !== 'cancelled') setStatus('Export failed');
+          return;
+        }
+        if (exportKey() !== key) { resetShareLabel(); return; }
+        const outcome = await shareEntry(entry);
+        if (outcome === 'needs-gesture') {
+          shareBtn.textContent = '⬆️ Ready: tap to share';
+        } else {
+          resetShareLabel();
+        }
         return;
       }
-      const { file, blob, filename } = exported;
 
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        try {
-          await navigator.share({ files: [file], title: filename });
-          return;
-        } catch (err) {
-          if (err.name === 'AbortError') return; // user dismissed the sheet
-        }
-      }
-
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      const outcome = await shareEntry(entry);
+      if (outcome === 'needs-gesture') setStatus('Share blocked, tap again');
+      else resetShareLabel();
     });
 
     upload.addEventListener('change', handleFile);
     camera.addEventListener('change', handleFile);
 
     syncUI();
+    applyView();
   })();
   </script>
 </body>
