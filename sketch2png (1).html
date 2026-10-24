@@ -214,7 +214,6 @@
   <header>
     <div class="title-wrap">
       <h1>sketch2PNG</h1>
-      <span id="hash-badge" class="badge">sha256: —</span>
     </div>
     <span id="meta" class="badge">Ready</span>
   </header>
@@ -223,7 +222,7 @@
   <div id="canvas-container" class="canvas-wrap bg-checker-dark">
     <div id="placeholder" class="placeholder">
       Tap <b>Load</b> or <b>Snap</b> below.<br>
-      <small>Exports include SHA-256 short-hashes for clean catalog indexing.<br>Pinch or double-tap the preview to zoom.</small>
+      <small>Pinch or double-tap the preview to zoom.</small>
     </div>
     <canvas id="canvas"></canvas>
     <div id="hud" class="canvas-hud">
@@ -327,8 +326,6 @@
       <span class="hint">SVG is traced into smooth Bézier curves. Black and White ink export one path; Keep Color exports stacked color layers.</span>
     </div>
 
-    <button id="sidecar-btn" class="btn small mb-8" type="button" style="width:100%;">{ } JSON Sidecar: Off</button>
-
     <div class="grid-2">
       <button id="copy-btn" class="btn" type="button">📋 Copy Image</button>
       <button id="share-btn" class="btn btn-primary" type="button">⬆️ Share / Save</button>
@@ -344,7 +341,6 @@ function hex2(v) {
 
 function luma3(c) { return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]; }
 
-// Cluster the ink colors, returned lightest first, with a per-pixel rank map (255 = no ink).
 function quantizeInk(data, w, h, K) {
   var n = w * h, i, s, ci;
   var lim = 200, cnt = 0;
@@ -421,7 +417,6 @@ function quantizeInk(data, w, h, K) {
   return { palette: pal, rank: rank };
 }
 
-// Ramer-Douglas-Peucker on a closed loop. Returns the kept vertex indices in order.
 function simplifyClosed(xs, ys, eps) {
   var n = xs.length, k, out = [];
   if (n < 5) { for (k = 0; k < n; k++) out.push(k); return out; }
@@ -458,7 +453,6 @@ function simplifyClosed(xs, ys, eps) {
 
 function rnd(v) { return Math.round(v * 100) / 100; }
 
-// Turn one simplified loop into a smooth closed cubic Bezier path.
 function loopPath(xs, ys, eps) {
   var idx = simplifyClosed(xs, ys, eps);
   var m = idx.length, k;
@@ -503,7 +497,6 @@ function loopPath(xs, ys, eps) {
   return d + 'Z';
 }
 
-// Marching squares on a soft alpha field, then stitch, simplify and curve-fit every loop.
 function traceField(field, w, h, eps) {
   var PW = w + 2, PH = h + 2, x, y;
   var P = new Float32Array(PW * PH);
@@ -605,7 +598,6 @@ function traceField(field, w, h, eps) {
   return parts.join('');
 }
 
-// msg: { data: RGBA Uint8ClampedArray, w, h, colorMode, ink, K, eps }
 function traceJob(msg) {
   var data = msg.data, w = msg.w, h = msg.h, n = w * h, i;
   var layers = [];
@@ -639,14 +631,13 @@ function traceJob(msg) {
   (() => {
     'use strict';
 
-    // ---------- Helpers ----------
     const $ = (id) => document.getElementById(id);
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
     const clamp255 = (v) => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
 
     const store = {
       get(key) { try { return localStorage.getItem(key); } catch (_) { return null; } },
-      set(key, value) { try { localStorage.setItem(key, value); } catch (_) { /* storage unavailable */ } }
+      set(key, value) { try { localStorage.setItem(key, value); } catch (_) {} }
     };
 
     const nextTick = () => new Promise((r) => setTimeout(r, 0));
@@ -658,17 +649,8 @@ function traceJob(msg) {
       c.height = Math.max(1, h);
       return c;
     }
-    // iOS Safari holds canvas memory until released, so shrink canvases we are done with.
     function release(c) { if (c) { c.width = 1; c.height = 1; } }
 
-    async function sha256(buffer) {
-      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-      return Array.from(new Uint8Array(hashBuffer))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-    }
-
-    // ---------- Vector tracer plumbing (worker with main-thread fallback) ----------
     const traceSrc = $('trace-src').textContent;
     const traceMain = new Function(traceSrc + '\nreturn traceJob;')();
     let workerURL = null;
@@ -717,7 +699,6 @@ function traceJob(msg) {
       });
     }
 
-    // ---------- Elements ----------
     const upload = $('upload');
     const camera = $('camera');
     const canvas = $('canvas');
@@ -748,7 +729,6 @@ function traceJob(msg) {
     const holdOrigBtn = $('hold-orig');
     const copyBtn = $('copy-btn');
     const shareBtn = $('share-btn');
-    const sidecarBtn = $('sidecar-btn');
 
     const canvasContainer = $('canvas-container');
     const placeholder = $('placeholder');
@@ -756,9 +736,7 @@ function traceJob(msg) {
     const exportPanel = $('export-panel');
     const svgOpts = $('svg-opts');
     const meta = $('meta');
-    const hashBadge = $('hash-badge');
 
-    // ---------- Constants ----------
     const PREVIEW_MAX = 1400;
     const PREVIEW_MAX_ZOOM = 3000;
     const EXPORT_MAX = 4096;
@@ -769,22 +747,15 @@ function traceJob(msg) {
     const bgClasses = ['bg-checker-dark', 'bg-checker-light', 'bg-emerald'];
     const bgNames = ['BG: Dark', 'BG: Light', 'BG: Green'];
 
-    // ---------- Settings ----------
     const DEFAULTS = {
       thresh: 180, smooth: 18, speck: 6, ink: 'black', trim: false, fmt: 'png', bg: 0,
-      flatten: true, lightInk: true, vecDetail: 6, vecColors: 4, sidecar: false
+      flatten: true, lightInk: true, vecDetail: 6, vecColors: 4
     };
 
     function loadSettings() {
       let saved = {};
       try { saved = JSON.parse(store.get('s2p_settings') || '{}') || {}; } catch (_) { saved = {}; }
-      const legacy = {};
-      const lt = parseInt(store.get('s2p_thresh'), 10);
-      const ls = parseInt(store.get('s2p_smooth'), 10);
-      if (!isNaN(lt)) legacy.thresh = lt;
-      if (!isNaN(ls)) legacy.smooth = ls;
-      if (INK_MODES.includes(store.get('s2p_inkMode'))) legacy.ink = store.get('s2p_inkMode');
-      const s = Object.assign({}, DEFAULTS, legacy, saved);
+      const s = Object.assign({}, DEFAULTS, saved);
       s.thresh = clamp(parseInt(s.thresh, 10) || DEFAULTS.thresh, 20, 250);
       s.smooth = clamp(isNaN(parseInt(s.smooth, 10)) ? DEFAULTS.smooth : parseInt(s.smooth, 10), 0, 75);
       s.speck = clamp(isNaN(parseInt(s.speck, 10)) ? DEFAULTS.speck : parseInt(s.speck, 10), 0, 60);
@@ -793,7 +764,7 @@ function traceJob(msg) {
       if (!INK_MODES.includes(s.ink)) s.ink = DEFAULTS.ink;
       if (!FORMATS.includes(s.fmt)) s.fmt = DEFAULTS.fmt;
       s.bg = clamp(parseInt(s.bg, 10) || 0, 0, bgClasses.length - 1);
-      s.trim = !!s.trim; s.flatten = !!s.flatten; s.lightInk = !!s.lightInk; s.sidecar = !!s.sidecar;
+      s.trim = !!s.trim; s.flatten = !!s.flatten; s.lightInk = !!s.lightInk;
       return s;
     }
 
@@ -804,17 +775,15 @@ function traceJob(msg) {
     vecDetailSlider.value = S.vecDetail;
     vecColorsSlider.value = S.vecColors;
 
-    // ---------- State ----------
     let sourceImage = null;
     let sourceId = 0;
     let sourceName = '';
-    let rotation = 0; // 0, 90, 180, 270
+    let rotation = 0;
     let autoTrim = S.trim;
     let flatten = S.flatten;
     let lightInk = S.lightInk;
     let inkMode = S.ink;
     let exportFormat = S.fmt;
-    let sidecarOn = S.sidecar;
     let bgIndex = S.bg;
     let showingOriginal = false;
     let hiRes = false;
@@ -831,12 +800,10 @@ function traceJob(msg) {
         ink: inkMode, trim: autoTrim, fmt: exportFormat, bg: bgIndex,
         flatten, lightInk,
         vecDetail: parseInt(vecDetailSlider.value, 10),
-        vecColors: parseInt(vecColorsSlider.value, 10),
-        sidecar: sidecarOn
+        vecColors: parseInt(vecColorsSlider.value, 10)
       }));
     }
 
-    // ---------- Apple touch icon (iOS ignores SVG icons, so render a PNG) ----------
     (function setupIcon() {
       const c = makeCanvas(180, 180);
       const g = c.getContext('2d');
@@ -863,7 +830,6 @@ function traceJob(msg) {
       document.head.appendChild(link);
     })();
 
-    // ---------- Status badge ----------
     let statusTimer = null;
     let busyCount = 0;
     let exportDims = null;
@@ -886,7 +852,6 @@ function traceJob(msg) {
       if (busyCount === 0) meta.textContent = dimsText();
     }
 
-    // ---------- UI sync ----------
     function syncUI() {
       threshVal.textContent = thresholdSlider.value;
       smoothVal.textContent = smoothingSlider.value;
@@ -902,8 +867,6 @@ function traceJob(msg) {
       flattenBtn.classList.toggle('active', flatten);
       lightBtn.textContent = `🖍 Light Ink: ${lightInk ? 'On' : 'Off'}`;
       lightBtn.classList.toggle('active', lightInk);
-      sidecarBtn.textContent = `{ } JSON Sidecar: ${sidecarOn ? 'On' : 'Off'}`;
-      sidecarBtn.classList.toggle('active', sidecarOn);
 
       document.querySelectorAll('.ink-mode').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.mode === inkMode);
@@ -916,7 +879,6 @@ function traceJob(msg) {
       vecColorsSlider.disabled = inkMode !== 'color';
     }
 
-    // ---------- Zoom and pan ----------
     const view = { s: 1, x: 0, y: 0 };
     const pointers = new Map();
     let pinch = null;
@@ -986,7 +948,7 @@ function traceJob(msg) {
 
     canvasContainer.addEventListener('pointerdown', (e) => {
       if (!sourceImage || e.target.closest('.hud-pill')) return;
-      try { canvasContainer.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      try { canvasContainer.setPointerCapture(e.pointerId); } catch (_) {}
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, t: performance.now() });
       if (pointers.size === 2) startPinch();
     });
@@ -1034,7 +996,6 @@ function traceJob(msg) {
 
     window.addEventListener('resize', () => { clampView(); applyView(); });
 
-    // ---------- File loading ----------
     const baseCache = new Map();
     const resultCache = new Map();
 
@@ -1048,7 +1009,7 @@ function traceJob(msg) {
 
     function handleFile(e) {
       const file = e.target.files[0];
-      e.target.value = ''; // allow re-selecting the same file
+      e.target.value = '';
       if (!file) return;
 
       const url = URL.createObjectURL(file);
@@ -1076,14 +1037,11 @@ function traceJob(msg) {
       img.src = url;
     }
 
-    // ---------- Geometry and base images ----------
     function getGeometry(maxDim) {
       const W = sourceImage.naturalWidth;
       const H = sourceImage.naturalHeight;
       const rot90 = rotation % 180 !== 0;
 
-      // Crop sliders are in on-screen terms, so after a 90/270 rotation
-      // the vertical slider maps to the source's horizontal axis.
       const vPct = parseInt(cropVSlider.value, 10) / 100;
       const hPct = parseInt(cropHSlider.value, 10) / 100;
       const xInset = (rot90 ? vPct : hPct) * W;
@@ -1095,13 +1053,12 @@ function traceJob(msg) {
       const sh = Math.max(1, Math.round(H - yInset * 2));
       const ow = rot90 ? sh : sw;
       const oh = rot90 ? sw : sh;
-      const scale = Math.min(1, maxDim / Math.max(ow, oh), Math.sqrt(AREA_CAP / (ow * oh)));
+      const scale = Math.min(1, maxDim / Math.max(ow, oh), Math.sqrt(AREA_CAP / (ow * ow)));
       const dw = Math.max(1, Math.round(sw * scale));
       const dh = Math.max(1, Math.round(sh * scale));
       return { sx, sy, sw, sh, rot90, scale, dw, dh, w: rot90 ? dh : dw, h: rot90 ? dw : dh };
     }
 
-    // Downscale in halving steps so large camera frames do not alias.
     function drawScaled(src, sx, sy, sw, sh, dw, dh) {
       let cur = src, cx = sx, cy = sy, cSw = sw, cSh = sh;
       let cw = sw, ch = sh;
@@ -1159,7 +1116,6 @@ function traceJob(msg) {
       return entry;
     }
 
-    // ---------- Paper (lighting) estimation ----------
     function maxFilter(src, gw, gh, r) {
       const tmp = new Float32Array(gw * gh);
       const out = new Float32Array(gw * gh);
@@ -1207,7 +1163,6 @@ function traceJob(msg) {
       return out;
     }
 
-    // Coarse per-channel estimate of the blank paper color across the frame.
     function computePaperGrid(data, w, h) {
       const blk = Math.max(4, Math.ceil(Math.max(w, h) / 110));
       const gw = Math.ceil(w / blk), gh = Math.ceil(h / blk);
@@ -1241,7 +1196,6 @@ function traceJob(msg) {
         g = boxBlur(g, gw, gh, 2);
         const sorted = Float32Array.from(g).sort();
         const P = sorted[Math.floor(0.85 * (sorted.length - 1))];
-        // Floor keeps large filled shapes from being normalized away.
         const floor = Math.max(24, 0.5 * P);
         for (let i = 0; i < g.length; i++) if (g[i] < floor) g[i] = floor;
         return g;
@@ -1249,7 +1203,6 @@ function traceJob(msg) {
       return { blk, gw, gh, chans };
     }
 
-    // ---------- Speck removal ----------
     function removeSpecks(data, w, h, minArea) {
       const n = w * h;
       const seen = new Uint8Array(n);
@@ -1283,7 +1236,6 @@ function traceJob(msg) {
       }
     }
 
-    // ---------- Core processing ----------
     function paramKey() {
       return [
         sourceId, rotation, cropVSlider.value, cropHSlider.value,
@@ -1364,7 +1316,6 @@ function traceJob(msg) {
             } else if (mode === 'white') {
               data[i] = 255; data[i + 1] = 255; data[i + 2] = 255;
             } else {
-              // Un-mix the paper contribution at soft edges, then boost chroma
               const inv = 1 / Math.max(alpha / 255, 0.25);
               const cr = clamp(255 - (255 - r) * inv, 0, 255);
               const cg = clamp(255 - (255 - g) * inv, 0, 255);
@@ -1379,7 +1330,6 @@ function traceJob(msg) {
         }
       }
 
-      // Speck size is defined at a 1000px long side so it behaves the same at any resolution.
       const speck = parseInt(speckSlider.value, 10);
       const minArea = Math.round(speck * Math.pow(Math.max(w, h) / 1000, 2));
       if (minArea >= 2) removeSpecks(data, w, h, minArea);
@@ -1422,7 +1372,6 @@ function traceJob(msg) {
       return entry;
     }
 
-    // ---------- Preview ----------
     let framePending = false;
     function scheduleProcess() {
       if (framePending) return;
@@ -1457,7 +1406,6 @@ function traceJob(msg) {
       if (busyCount === 0) meta.textContent = dimsText();
     }
 
-    // ---------- Export ----------
     function vecEps() {
       return 1.8 * Math.pow(0.78, parseInt(vecDetailSlider.value, 10) - 1);
     }
@@ -1503,14 +1451,14 @@ function traceJob(msg) {
         const mime = exportFormat === 'webp' ? 'image/webp' : 'image/png';
         blob = await canvasToBlob(res.canvas, mime, 0.92);
         if (!blob) throw new Error('Encode failed');
-        if (blob.type !== mime && blob.type === 'image/png') ext = 'png'; // browser fell back to PNG
+        if (blob.type !== mime && blob.type === 'image/png') ext = 'png';
         width = res.w; height = res.h;
       }
 
-      const hash = await sha256(await blob.arrayBuffer());
-      const filename = `sketch_${hash.slice(0, 12)}.${ext}`;
+      const timestamp = Math.floor(Date.now() / 1000);
+      const filename = `sketch_${timestamp}.${ext}`;
       return {
-        blob, filename, hash, ext, width, height,
+        blob, filename, ext, width, height,
         fellBack: exportFormat === 'webp' && ext === 'png',
         file: new File([blob], filename, { type: blob.type })
       };
@@ -1536,45 +1484,14 @@ function traceJob(msg) {
     let prepTimer = null;
     function schedulePrepare() {
       if (!sourceImage) return;
-      hashBadge.textContent = 'sha256: …';
-      delete hashBadge.dataset.fullHash;
       clearTimeout(prepTimer);
       prepTimer = setTimeout(() => {
         const key = exportKey();
         prepareExport().then((r) => {
           if (exportKey() !== key) return;
-          hashBadge.textContent = `sha256: ${r.hash.slice(0, 8)}`;
-          hashBadge.dataset.fullHash = r.hash;
           if (r.fellBack) setStatus('WebP unsupported, using PNG');
-        }).catch(() => { /* superseded or failed; the next change retries */ });
+        }).catch(() => {});
       }, 900);
-    }
-
-    function makeSidecar(entry) {
-      const data = {
-        file: entry.filename,
-        sha256: entry.hash,
-        format: entry.ext,
-        width: entry.width,
-        height: entry.height,
-        createdAt: new Date().toISOString(),
-        source: sourceName || null,
-        settings: {
-          ink: inkMode,
-          threshold: parseInt(thresholdSlider.value, 10),
-          smoothing: parseInt(smoothingSlider.value, 10),
-          speckRemoval: parseInt(speckSlider.value, 10),
-          evenLighting: flatten,
-          lightInk,
-          trim: autoTrim,
-          rotation,
-          cropPercent: { topBottom: parseInt(cropVSlider.value, 10), leftRight: parseInt(cropHSlider.value, 10) },
-          vector: entry.ext === 'svg'
-            ? { detail: parseInt(vecDetailSlider.value, 10), colors: inkMode === 'color' ? parseInt(vecColorsSlider.value, 10) : 1 }
-            : null
-        }
-      };
-      return new File([JSON.stringify(data, null, 2)], entry.filename.replace(/\.[^.]+$/, '') + '.json', { type: 'application/json' });
     }
 
     function downloadFile(file) {
@@ -1590,7 +1507,6 @@ function traceJob(msg) {
 
     async function shareEntry(entry) {
       const files = [entry.file];
-      if (sidecarOn) files.push(makeSidecar(entry));
 
       if (navigator.canShare && navigator.canShare({ files })) {
         try {
@@ -1599,7 +1515,6 @@ function traceJob(msg) {
         } catch (err) {
           if (err.name === 'AbortError') return 'cancelled';
           if (err.name === 'NotAllowedError') return 'needs-gesture';
-          // otherwise fall through to download
         }
       }
       files.forEach((f, idx) => setTimeout(() => downloadFile(f), idx * 350));
@@ -1608,7 +1523,6 @@ function traceJob(msg) {
 
     function resetShareLabel() { shareBtn.textContent = SHARE_LABEL; }
 
-    // ---------- Change handlers ----------
     function changed() {
       resetShareLabel();
       saveSettings();
@@ -1624,7 +1538,6 @@ function traceJob(msg) {
       schedulePrepare();
     }
 
-    // ---------- Events ----------
     [thresholdSlider, smoothingSlider, speckSlider, cropVSlider, cropHSlider].forEach((slider) => {
       slider.addEventListener('input', changed);
     });
@@ -1656,7 +1569,6 @@ function traceJob(msg) {
     trimBtn.addEventListener('click', () => { autoTrim = !autoTrim; changed(); });
     flattenBtn.addEventListener('click', () => { flatten = !flatten; changed(); });
     lightBtn.addEventListener('click', () => { lightInk = !lightInk; changed(); });
-    sidecarBtn.addEventListener('click', () => { sidecarOn = !sidecarOn; changedExportOnly(); });
 
     bgBtn.addEventListener('click', () => {
       canvasContainer.classList.remove(bgClasses[bgIndex]);
@@ -1668,7 +1580,6 @@ function traceJob(msg) {
 
     fitBtn.addEventListener('click', resetView);
 
-    // Hold to preview the original (pointer events cover touch and mouse once)
     function releaseOriginal() {
       if (!showingOriginal) return;
       showingOriginal = false;
@@ -1676,7 +1587,7 @@ function traceJob(msg) {
     }
     holdOrigBtn.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      try { holdOrigBtn.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      try { holdOrigBtn.setPointerCapture(e.pointerId); } catch (_) {}
       showingOriginal = true;
       processImage();
     });
@@ -1685,8 +1596,6 @@ function traceJob(msg) {
     });
     holdOrigBtn.addEventListener('contextmenu', (e) => e.preventDefault());
 
-    // Clipboard copy. Safari needs the blob passed as a promise so the
-    // user gesture survives the async encode.
     copyBtn.addEventListener('click', async () => {
       if (!sourceImage) return;
       const label = '📋 Copy Image';
@@ -1711,8 +1620,6 @@ function traceJob(msg) {
       }
     });
 
-    // Share / save. A ready file shares instantly (iOS requires the tap to still be
-    // fresh); otherwise it prepares, and asks for a second tap if the share sheet needs one.
     shareBtn.addEventListener('click', async () => {
       if (!sourceImage) return;
       const key = exportKey();
